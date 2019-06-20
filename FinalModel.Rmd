@@ -1,0 +1,299 @@
+---
+title: "Data Science Capstone:  Final Model"
+author: "Scott Duda"
+date: `r format(Sys.Date(), "%B %d, %Y")`
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r message=FALSE, warning=FALSE}
+
+library(NLP)
+library(tm)
+library(SnowballC)
+library(ngram)
+library(RWeka)
+library(slam)
+library(stringr)
+library(tidyr)
+library(dplyr)
+library(data.table)
+
+```
+
+
+## Download Data
+
+```{r eval=FALSE}
+
+dataURL <- "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+download.file(dataURL, destfile="capstone.zip")
+unzip("capstone.zip")
+
+```
+
+#### Profanity Data
+
+``` {r}
+
+profanityURL <- "https://www.cs.cmu.edu/~biglou/resources/bad-words.txt"
+download.file(profanityURL, destfile = "profanity.txt")
+profanity <- read.delim("profanity.txt", header=FALSE)
+
+```
+
+## Load Data
+
+```{r}
+
+blogdata <- readLines("final/en_US/en_US.blogs.txt", encoding="UTF-8", skipNul=TRUE)
+twitterdata <- readLines("final/en_US/en_US.twitter.txt", encoding="UTF-8", skipNul=TRUE)
+newsdata <- readLines("final/en_US/en_US.news.txt", encoding="UTF-8", skipNul=TRUE)
+
+```
+
+## Define Useful Functions
+
+#### Data Table Merging Function
+
+``` {r}
+
+base_merge <- function(dt_base, dt_temp) {
+    dt_ret <- merge(dt_base, dt_temp, by="Row.names", all=TRUE)
+    dt_ret[is.na(dt_ret)] <- 0
+    dt_ret['Freq'] <- dt_ret['Freq.x'] + dt_ret['Freq.y']
+    dt_ret <- dt_ret[c('Row.names', 'Freq')]
+    dt_ret
+}
+
+```
+
+#### Kneser-Ney Smoothing Probability Function
+
+``` {r}
+
+KNprep <- function(dt, n) {
+
+    col <- colnames(dt)
+    col <- col[1:n]
+    
+    c1 <- min(dt$Freq)
+    c2 <- min(subset(dt, Freq>c1)$Freq) 
+    Y <- nrow(dt[Freq == c1]) / (nrow(dt[Freq == c1]) + 2 * nrow(dt[Freq == c2])) 
+    
+    dt[, D := 0]
+    dt[Freq == 1]$D <- 1 - 2 * Y * (nrow(dt[Freq == 2]) / nrow(dt[Freq == 1]))
+    dt[Freq == 2]$D <- 2 - 3 * Y * (nrow(dt[Freq == 3]) / nrow(dt[Freq == 2]))
+    dt[Freq >= 3]$D  <- 3 - 4 * Y * (nrow(dt[Freq == 4]) / nrow(dt[Freq == 3]))
+
+    dt <- dt[, Nom := pmax(Freq-D, 0)]
+    
+    if(n==1) {
+        dt <- dt[, Denom := sum(Freq)]
+    } else if (n==2) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom = sum(Freq)), by = w1]
+    } else if (n==3) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom = sum(Freq)), by = list(w2, w1)]
+    } else if (n==4) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom = sum(Freq)), by = list(w3, w2, w1)]
+    }
+
+    if(n==1) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom, NN = length(w))]
+    } else if (n==2) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom, NN = length(w)), by=w1]
+    } else if (n==3) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom, NN = length(w)), by=list(w2, w1)]
+    } else if (n==4) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom, NN = length(w)), by=list(w3, w2, w1)]
+    }
+    
+    dt[, L := (D / Freq) * NN]
+
+    if(n==1) {
+        dt <- dt[, .(w, Freq, D, Nom, Denom, NN, L, .N)]
+    } else if (n==2) {
+        dt <- dt[, .(w1, Freq, D, Nom, Denom, NN, L, .N), by=w]
+    } else if (n==3) {
+        dt <- dt[, .(w2, w1, Freq, D, Nom, Denom, NN, L, .N), by=w]
+    } else if (n==4) {
+        dt <- dt[, .(w3, w2, w1, Freq, D, Nom, Denom, NN, L, .N), by=w]
+    }
+
+    dt[, PC := N / nrow(dt)] 
+    dt[, P_KN := (Nom/Denom) + ((D/Denom) * NN) * PC]
+    dt[, MLE := (Freq/Denom)]
+    
+    return(dt)
+}
+
+```
+
+## Create Model
+
+Model creation is accomplished by processing 20,000-line segments from each source and storing the results in a data table. This process is repeated in 20,000 line increments a total of 25 times. In total, 500,000 lines from each data source are analyzed.
+
+``` {r message=FALSE, warning=FALSE}
+
+counter <- 1
+chunk_size <- 20000
+chunk_start <- 1
+chunk_end <- chunk_size
+
+while (counter < 25) {
+    
+    # Create Dataset Samples
+    
+    blog_sample <- blogdata[chunk_start:chunk_end]
+    twitter_sample <- twitterdata[chunk_start:chunk_end]
+    news_sample <- newsdata[chunk_start:chunk_end]
+    
+    # Create Corpus 
+
+    corpus_vector <- c(blog_sample, twitter_sample, news_sample)
+    predict_corpus <- VCorpus(VectorSource(corpus_vector), readerControl=list(readPlain, language="en", load=TRUE))
+
+    # Clean Corpus
+
+    predict_corpus <- tm_map(predict_corpus, content_transformer(tolower))
+    predict_corpus <- tm_map(predict_corpus, content_transformer(removePunctuation))
+    predict_corpus <- tm_map(predict_corpus, content_transformer(removeNumbers))
+
+    remove_web  <- function(x) gsub("http:[[:alnum:]]*", "", x)
+    predict_corpus <- tm_map(predict_corpus, content_transformer(remove_web))
+
+    remove_additional_chars <- function(x) gsub("[^[:alnum:][:space:]]", "", x)
+    predict_corpus <- tm_map(predict_corpus, content_transformer(remove_additional_chars))
+
+    remove_nonaz <- function(x) gsub("[^a-z ]", "", x)
+    predict_corpus <- tm_map(predict_corpus, content_transformer(remove_nonaz))
+    
+
+    predict_corpus <- tm_map(predict_corpus, content_transformer(stripWhitespace))
+    
+    names(profanity) <- c("badword")
+    profanity_list <- profanity$badword
+
+    predict_corpus <- tm_map(predict_corpus, removeWords, profanity_list)
+
+    # N-Gram Tokenization
+    
+    # Unigrams
+
+    toke_uni <- function(x) NGramTokenizer(x, Weka_control(min=1, max=1))
+    unigrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_uni))
+    freq_uni <- sort(col_sums(unigrams), decreasing=TRUE)
+
+    # Bigrams
+
+    toke_bi <- function(x) NGramTokenizer(x, Weka_control(min=2, max=2))
+    bigrams <-DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_bi))
+    freq_bi <- sort(col_sums(bigrams), decreasing=TRUE)
+
+    # Trigrams
+
+    toke_tri <- function(x) NGramTokenizer(x, Weka_control(min=3, max=3))
+    trigrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_tri))
+    freq_tri <- sort(col_sums(trigrams), decreasing=TRUE)
+
+    # 4-grams
+
+    toke_four <- function(x) NGramTokenizer(x, Weka_control(min=4, max=4))
+    fourgrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_four))
+    freq_four <- sort(col_sums(fourgrams), decreasing=TRUE)
+
+
+    # Set up frequency dataframes
+    
+    df_full_freq_uni <- data.frame(token=names(freq_uni), Freq=freq_uni)
+    df_full_freq_bi <- data.frame(token=names(freq_bi), Freq=freq_bi)
+    df_full_freq_tri <- data.frame(token=names(freq_tri), Freq=freq_tri)
+    df_full_freq_four <- data.frame(token=names(freq_four), Freq=freq_four)
+
+    df_full_freq_uni['Row.names'] <- row.names(df_full_freq_uni)
+    df_full_freq_bi['Row.names'] <- row.names(df_full_freq_bi)
+    df_full_freq_tri['Row.names'] <- row.names(df_full_freq_tri)
+    df_full_freq_four['Row.names'] <- row.names(df_full_freq_four)
+
+    # On first pass, create base dataframe
+    if (counter == 1) {
+    
+        base_uni <- df_full_freq_uni
+        base_bi <- df_full_freq_bi
+        base_tri <- df_full_freq_tri
+        base_four <- df_full_freq_four
+
+    }
+    
+    # On subsequent passes, merge current dataframe with base dataframe
+    else {
+        
+        base_uni <- base_merge(base_uni, df_full_freq_uni)
+        base_bi <- base_merge(base_bi, df_full_freq_bi)
+        base_tri <- base_merge(base_tri, df_full_freq_tri)
+        base_four <- base_merge(base_four, df_full_freq_four)
+
+    }
+    
+    counter <- counter + 1
+    chunk_start <- chunk_start + chunk_size
+    chunk_end <- chunk_end + chunk_size
+}
+
+
+# Split each n-gram into a prefix and final word
+
+names(base_uni) <- c("w", "Freq")
+base_bi <- base_bi %>% separate(Row.names, c("w1", "w"), sep=" ")
+base_tri <- base_tri %>% separate(Row.names, c("w1", "w2", "w"), sep=" ")
+base_four <- base_four %>% separate(Row.names, c("w1", "w2", "w3", "w"), sep=" ")
+
+```
+
+## Create, Prune, and Save n-gram Probability Tables 
+
+``` {r}
+
+setDT(base_uni)
+setDT(base_bi)
+setDT(base_tri)
+setDT(base_four)
+
+prob_dt_base_uni <- KNprep(base_uni, 1)
+prob_dt_base_bi <- KNprep(base_bi, 2)
+prob_dt_base_tri <- KNprep(base_tri, 3)
+prob_dt_base_four <- KNprep(base_four, 4)
+
+pruned_prob_dt_base_uni <- prob_dt_base_uni[Freq > 2]
+pruned_prob_dt_base_bi <- prob_dt_base_bi[Freq > 2]
+pruned_prob_dt_base_tri <- prob_dt_base_tri[Freq > 2]
+pruned_prob_dt_base_four <- prob_dt_base_four[Freq > 2]
+
+prob_dt_base_uni <- pruned_prob_dt_base_uni[order(-P_KN, w)]
+prob_dt_base_bi <- pruned_prob_dt_base_bi[order(-P_KN, w)]
+prob_dt_base_tri <- pruned_prob_dt_base_tri[order(-P_KN, w)]
+prob_dt_base_four <- pruned_prob_dt_base_four[order(-P_KN, w)]
+
+prob_uni <- prob_dt_base_uni[, c('w', 'Freq', 'P_KN')]
+prob_bi <- prob_dt_base_bi[, c('w', 'w1', 'Freq', 'P_KN')]
+names(prob_bi) <- c('w', 'pred', 'Freq', 'P_KN')
+
+prob_tri <- prob_dt_base_tri[, c('w', 'w1', 'w2', 'Freq', 'P_KN')]
+prob_tri <- prob_tri[, pred:=do.call(paste, c(.SD, sep=" ")), .SDcols=2:3]
+prob_tri <- prob_tri[, c('w', 'pred', 'Freq', 'P_KN')]
+
+prob_four <- prob_dt_base_four[, c('w', 'w1', 'w2', 'w3', 'Freq', 'P_KN')]
+prob_four <- prob_four[, pred:=do.call(paste, c(.SD, sep=" ")), .SDcols=2:4]
+prob_four <- prob_four[, c('w', 'pred', 'Freq', 'P_KN')]
+
+saveRDS(prob_uni, file="pred_uni.RDS")
+saveRDS(prob_bi, file="pred_bi.RDS")
+saveRDS(prob_tri, file="pred_tri.RDS")
+saveRDS(prob_four, file="pred_four.RDS")
+
+```

@@ -1,0 +1,444 @@
+---
+title: "Data Science Capstone:  Milestone Report"
+author: "Scott Duda"
+date: "5/18/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Project Background
+
+The capstone course project centers around development of a predictive text model that can be used to predict the next word in a series of words entered by a user. A user may enter one, two, or three words, and the model should predict the next word in the phrase based on those inputs. The model that is developed during this project will be deployed using an interactive Shiny application.
+
+## Load Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(NLP)
+library(tm)
+library(SnowballC)
+library(ngram)
+library(RWeka)
+library(slam)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(dplyr)
+
+```
+
+## Download Data
+
+Data for construction of the predictive text model were derived from HC Corpora, a corpora of text scraped from blogs, twitter, and news websites. The dataset includes corpora in English, German, Russian, and Finnish. We will be looking at the English corpora only for development of this predictive model.
+
+```{r eval=FALSE}
+dataURL <- "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+download.file(dataURL, destfile="capstone.zip")
+unzip("capstone.zip")
+```
+## Data Analysis
+
+#### Load Data
+
+```{r}
+blogdata <- readLines("final/en_US/en_US.blogs.txt", encoding="UTF-8", skipNul=TRUE)
+twitterdata <- readLines("final/en_US/en_US.twitter.txt", encoding="UTF-8", skipNul=TRUE)
+newsdata <- readLines("final/en_US/en_US.news.txt", encoding="UTF-8", skipNul=TRUE)
+```
+
+#### Raw Data File Sizes
+
+``` {r}
+blog_file_size <- file.info("final/en_US/en_US.blogs.txt")$size / (1024.0 ^ 2)
+twitter_file_size <- file.info("final/en_US/en_US.twitter.txt")$size / (1024.0 ^ 2)
+news_file_size <- file.info("final/en_US/en_US.news.txt")$size / (1024.0 ^ 2)
+```
+
+#### Line Counts of Raw Data Files
+
+``` {r}
+bloglines <- length(blogdata)
+twitterlines <- length(twitterdata)
+newslines <- length(newsdata)
+```
+
+#### Word Counts of Raw Data Files
+
+```{r}
+blog_word_count <- wordcount(blogdata)
+twitter_word_count <- wordcount(twitterdata)
+news_word_count <- wordcount(newsdata)
+```
+
+#### Summary
+
+The dataframe developed by the code chunk below includes some summary information about the raw data files, including file size, line count, and approximate word count.
+
+```{r}
+file_names <- c("en_US.blogs.txt", "en_US.twitter.txt", "en_US.news.txt")
+file_sizes <- c(blog_file_size, twitter_file_size, news_file_size)
+file_lines <- c(bloglines, twitterlines, newslines)
+file_word_counts <- c(blog_word_count, twitter_word_count, news_word_count)
+tab_cols <- c("File Name", "File Size (Mb)", "# of Lines", "# of Words")
+summary <- data.frame(file_names, file_sizes, file_lines, file_word_counts)
+colnames(summary) <- tab_cols 
+summary
+```
+## Corpus Creation & Cleaning
+
+#### Create Dataset Samples
+
+To conserve memory and limit run times during model development, a random sample of 10,000 lines was taken from each of the three datasets for development of the model corpus.
+
+``` {r}
+blog_sample <- blogdata[sample(1:length(blogdata), 20000)]
+twitter_sample <- twitterdata[sample(1:length(twitterdata), 20000)]
+news_sample <- newsdata[sample(1:length(newsdata), 20000)]
+```
+
+#### Create Corpus 
+
+``` {r}
+corpus_vector <- c(blog_sample, twitter_sample, news_sample)
+predict_corpus <- VCorpus(VectorSource(corpus_vector), readerControl=list(readPlain, language="en", load=TRUE))
+```
+
+
+#### Clean Corpus
+
+The raw corpus must be cleaned before it can be analyzed. Initial cleaning includes conversion of all text to lowercase, removal of punctuation, and removal of numbers.
+
+``` {r}
+predict_corpus <- tm_map(predict_corpus, content_transformer(tolower))
+predict_corpus <- tm_map(predict_corpus, content_transformer(removePunctuation))
+predict_corpus <- tm_map(predict_corpus, content_transformer(removeNumbers))
+```
+
+Next, web URLs are removed and extraneous whitespace is stripped from the corpus. Stopwords, which are extremely common words that are often filtered out of seach queries since they do not provide useful information, are also removed from the corpus.
+
+``` {r}
+
+remove_web  <- function(x) gsub("http:[[:alnum:]]*", "", x)
+predict_corpus <- tm_map(predict_corpus, content_transformer(remove_web))
+predict_corpus <- tm_map(predict_corpus, content_transformer(stripWhitespace))
+# predict_corpus <- tm_map(predict_corpus, removeWords, stopwords("english"))
+```
+
+
+#### Create Profanity Filter
+
+This project requires development of a filter for removal of profanity within the source material. The code chunk below downloads a set of "bad words" to be filtered from the dataset. These words were compiled by Luis von Ahn's research group at Carnegie Mellon University. The list includes over 1,300 English words that may be found offensive. The list also includes several words which may be considered "neutral" but which are often assocaited with conversations that vear towards profanity and offensiveness. 
+
+```{r}
+profanityURL <- "https://www.cs.cmu.edu/~biglou/resources/bad-words.txt"
+download.file(profanityURL, destfile = "/Users/scottduda/Projects/datasciencecoursera/capstone/profanity.txt")
+profanity <- read.delim("profanity.txt", header=FALSE)
+names(profanity) <- c("badword")
+profanity_list <- profanity$badword
+
+predict_corpus <- tm_map(predict_corpus, removeWords, profanity_list)
+```
+
+
+## N-Gram Tokenization
+
+The predictive model that will be used to create the Shiny application will be built upon analysis of n-grams. N-grams are ordered sequences of n items (in this case, words). The predictive model will need to evaluate sequences containing one to three words when predicting the user's next word. As a result, development of the model will require analysis of 1-gram (unigram), 2-gram (bigram), or 3-gram (trigram) models. 
+
+In order to extract all n-grams from the corpus, the corpus must be tokenized. Tokenization refers to the segmentation of a dataset into unique "tokens" for analysis. In the case of a unigram model, each word represents a token. In a bigram model, each token refers to a two-word phrase appearing in the corpus. In a trigram model, each token refers to a unique three-word phrase. 
+
+Unigrams, bigrams, and trigrams are tokenized from the corpus and stored in Document Term Matrices for model development. A barplot illustrating the 20 most common tokens of each n-gram is generated.
+
+
+#### Unigrams
+
+```{r}
+
+toke_uni <- function(x) NGramTokenizer(x, Weka_control(min=1, max=1))
+unigrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_uni))
+freq_uni <- sort(col_sums(unigrams), decreasing=TRUE)
+#freq_uni <- sort(rowSums(as.matrix(unigrams)), decreasing=TRUE)
+
+df_freq_uni <- data.frame(word=names(freq_uni[1:20]), count=freq_uni[1:20])
+ggplot(df_freq_uni, aes(reorder(word, -count), count)) +
+    geom_bar(stat="identity", fill="green") +
+    ggtitle("Top 20 Unigrams in Corpus") +
+    xlab("Unigrams") +
+    ylab("Count") + 
+    theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+
+
+#### Bigrams
+
+Next, bigrams are extracted from the corpus and a barplot illustrating the 20 most common bigrams is generated.
+
+```{r}
+
+toke_bi <- function(x) NGramTokenizer(x, Weka_control(min=2, max=2))
+bigrams <-DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_bi))
+freq_bi <- sort(col_sums(bigrams), decreasing=TRUE)
+
+df_freq_bi <- data.frame(word=names(freq_bi[1:20]), count=freq_bi[1:20])
+ggplot(df_freq_bi, aes(reorder(word, -count), count)) +
+    geom_bar(stat="identity", fill="blue") +
+    ggtitle("Top 20 Bigrams in Corpus") +
+    xlab("Bigrams") +
+    ylab("Count") + 
+    theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+
+#### Trigrams
+
+Lastly, trigrams are extracted from the dataset and the 20 most common examples are plotted.
+
+```{r}
+
+toke_tri <- function(x) NGramTokenizer(x, Weka_control(min=3, max=3))
+trigrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_tri))
+freq_tri <- sort(col_sums(trigrams), decreasing=TRUE)
+
+df_freq_tri <- data.frame(word=names(freq_tri[1:20]), count=freq_tri[1:20])
+ggplot(df_freq_tri, aes(reorder(word, -count), count)) +
+    geom_bar(stat="identity", fill="red") +
+    ggtitle("Top 20 Trigrams in Corpus") +
+    xlab("Trigrams") +
+    ylab("Count") + 
+    theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+
+#### 4-grams
+
+4-grams are extracted from the dataset and the 20 most common examples are plotted.
+
+```{r}
+
+toke_four <- function(x) NGramTokenizer(x, Weka_control(min=4, max=4))
+fourgrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_four))
+freq_four <- sort(col_sums(fourgrams), decreasing=TRUE)
+
+df_freq_four <- data.frame(word=names(freq_four[1:20]), count=freq_four[1:20])
+ggplot(df_freq_four, aes(reorder(word, -count), count)) +
+    geom_bar(stat="identity", fill="orange") +
+    ggtitle("Top 20 4-grams in Corpus") +
+    xlab("4-grams") +
+    ylab("Count") + 
+    theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+#### 5-grams
+
+```{r}
+
+toke_five <- function(x) NGramTokenizer(x, Weka_control(min=5, max=5))
+fivegrams <- DocumentTermMatrix(predict_corpus, control=list(tokenize=toke_five))
+freq_five <- sort(col_sums(fivegrams), decreasing=TRUE)
+
+df_freq_five <- data.frame(word=names(freq_five[1:20]), count=freq_five[1:20])
+ggplot(df_freq_five, aes(reorder(word, -count), count)) +
+    geom_bar(stat="identity", fill="orange") +
+    ggtitle("Top 20 5-grams in Corpus") +
+    xlab("4-grams") +
+    ylab("Count") + 
+    theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+
+
+## Observations
+
+* Creation and manipulaton of the corpus is memory intensive. Sampling is essential based on available computer resources. The full dataset may be used, but it would require the use of cloud resources. 
+* Max counts of n-grams decrease as n increases. The most prevalent trigrams appear approx. 25 times vs. the most prevalent bigrams appearing approx. 200 times and the most prevalent unigrams appearing approx. 2,900 times.
+* Removal of stopwords is problematic since these words are used frequently in conversation. However, their overrepresentation in the corpus will cause them to be overpredicted, so they must be removed. Consider ways of including stopwords that may not result in their overprediction.
+* Profanity filtering removed a relatively limited number of words, even with a restrictive filter containing over 1,300 "bad" words. Consider using a more targeted profanity filter or removing profanity filter. Results may be more offensive but would be more accurately representative of the way people communicate. Based on the limited number of items removed by the profanity filter, the inclusion of profanity would likely have a minimal impact on the predictive model.
+* Stemming of the words in the corpus was not performed. Stemming can decrease the preceision of text classification algorithms. This occurs as a result of overstemming, which occurs when words that are truly distinct may be combined since they have the same root. Consider evaluating performance of stemmed vs. unstemmed model.
+* It may be interesting to look at the top unigrams, bigrams, and trigrams within each individual text source.
+
+
+## Next Steps
+
+* Use the n-grams pulled from the corpus to generate a basic n-gram model that can predict the next word using 1, 2, or 3 words.
+* Add a model that handles unseen n-grams, i.e. n-grams that do not appear in the corpus. Use a backoff model to estimate the probability of an unobserved n-gram occuring.
+* Consider the need for larger n-gram models.
+* Figure out how to store the models efficiently to allow them for deployment in a relatively lightweight app.
+* Create a Shiny application that applies the model to user inputted text.
+* Develop criteria for evaluation of model performance.
+* Optimize app performance and accuracy.
+
+
+``` {r}
+# input <- "new"
+# head(freq_bi[grep(paste0("^\\b", input, "\\b"), names(freq_bi))])
+
+ uni_predict <- function(uni) {
+     ret_val <- names(freq_bi[grep(paste0("^\\b", uni, "\\b"), names(freq_bi))])[1]
+     ret_uni <- strsplit(as.character(ret_val), split=" ")[[1]][2]
+     ret_uni
+ }
+ 
+ bi_predict <- function(bi) {
+     ret_val <- names(freq_tri[grep(paste0("^\\b", bi, "\\b"), names(freq_tri))])[1]
+
+     if (length(strsplit(bi, split=" ")[[1]]) < 2) {
+         ret_val <- uni_predict(bi)
+     }
+     
+     else if (is.na(ret_val)) {
+         term <- strsplit(bi, split=" ")[[1]][2]
+         ret_val <- uni_predict(term)
+     }
+     
+     else {
+         ret_val <- strsplit(as.character(ret_val), split=" ")[[1]][3]
+     }
+     
+     ret_val
+         
+ }
+ 
+ tri_predict <- function(tri) {
+    ret_val <- names(freq_four[grep(paste0("^\\b", tri, "\\b"), names(freq_four))])[1]
+    
+    if (length(strsplit(tri, split=" ")[[1]]) == 2) {
+        ret_val <- bi_predict(tri)
+    }
+    
+    else if (length(strsplit(tri, split=" ")[[1]]) < 2) {
+        ret_val <- uni_predict(tri)
+    }
+    
+    else if (is.na(ret_val)) {
+         term <- strsplit(tri, split=" ")[[1]][2]
+         term <- paste(c(term), strsplit(tri, split=" ")[[1]][3])
+         ret_val <- bi_predict(term)
+    }
+    
+    else {
+        ret_val <- strsplit(as.character(ret_val), split=" ")[[1]][4]
+    }
+    
+    ret_val
+ }
+ 
+ four_predict <- function(four_gram) {
+    ret_val <- names(freq_five[grep(paste0("^\\b", four_gram, "\\b"), names(freq_five))])[1]
+    
+    if (length(strsplit(four_gram, split=" ")[[1]]) == 3) {
+        ret_val <- tri_predict(four_gram)
+    }
+    
+    else if (length(strsplit(four_gram, split=" ")[[1]]) == 2) {
+        ret_val <- bi_predict(four_gram)
+    }
+    
+    else if (length(strsplit(four_gram, split=" ")[[1]]) < 2) {
+        ret_val <- uni_predict(four_gram)
+    }
+    
+    else if (is.na(ret_val)) {
+         term <- strsplit(four_gram, split=" ")[[1]][2]
+         term <- paste(c(term), strsplit(four_gram, split=" ")[[1]][3])
+         term <- paste(c(term), strsplit(four_gram, split=" ")[[1]][4])
+         ret_val <- tri_predict(term)
+    }
+    
+    else {
+        ret_val <- strsplit(as.character(ret_val), split=" ")[[1]][5]
+    }
+    
+    ret_val
+ }
+
+
+ 
+next_predict <- function(input_phrase) {
+    phrase_length <- length(strsplit(input_phrase, split=" ")[[1]])
+
+    if (phrase_length == 4) {
+        four_predict(input_phrase)
+    }
+    else if (phrase_length == 3) {
+        tri_predict(input_phrase)
+    }
+    else if (phrase_length == 2) {
+        bi_predict(input_phrase)
+    }
+    else if (phrase_length == 1) {
+        uni_predict(input_phrase)
+    }
+    
+}
+```
+
+
+``` {r}
+
+df_full_freq_uni <- data.frame(token=names(freq_uni), count=freq_uni)
+df_full_freq_bi <- data.frame(token=names(freq_bi), count=freq_bi)
+df_full_freq_tri <- data.frame(token=names(freq_tri), count=freq_tri)
+df_full_freq_four <- data.frame(token=names(freq_four), count=freq_four)
+df_full_freq_five <- data.frame(token=names(freq_five), count=freq_five)
+
+
+df_full_freq_bi <- df_full_freq_bi %>% separate(token, c("word1", "word2"), sep=" ")
+
+df_full_freq_tri <- df_full_freq_tri %>% separate(token, c("word1", "word2", "word3"), sep=" ")
+df_full_freq_tri <- df_full_freq_tri %>% unite(bigram, word1, word2, sep=" ")
+
+df_full_freq_four <- df_full_freq_four %>% separate(token, c("word1", "word2", "word3", "word4"), sep=" ")
+df_full_freq_four <- df_full_freq_four %>% unite(trigram, word1, word2, word3, sep=" ")
+
+df_full_freq_five <- df_full_freq_five %>% separate(token, c("word1", "word2", "word3", "word4", "word5"), sep=" ")
+df_full_freq_five <- df_full_freq_five %>% unite(fourgram, word1, word2, word3, word4, sep=" ")
+
+```
+
+``` {r}
+
+for (token in df_full_freq_uni$token) {
+    sub <- grep(paste0("^\\b", token, "\\b"), df_full_freq_bi$token)
+    total_bigrams <- sum(df_full_freq_bi[sub, 'count'])
+
+    for (bi in df_full_freq_bi[sub,]) {
+        df_full_freq_bi[as.character(bi), "prob"] <- df_full_freq_bi[as.character(bi), "count"] / total_bigrams
+    }
+    
+}
+
+```
+
+
+``` {r}
+
+bigram_totals <- aggregate(df_full_freq_tri$count, by=list(bigram=df_full_freq_tri$bigram), FUN=sum)
+
+```
+
+``` {r}
+
+calc_prob <- function(x) {
+    x['prob'] <- as.numeric(x['count']) / bigram_totals[bigram_totals['bigram'] == x['bigram'], 'x']
+}
+
+```
+
+
+```{r}
+df_full_freq_tri['prob'] <- apply(df_full_freq_tri, 1, calc_prob)
+```
+
+``` {r}
+
+calc_prob_2 <- function(item) {
+    item_count <- as.numeric(item['count'])
+    bigram_count <- bigram_totals[bigram_totals['bigram'] == item['bigram'][[1]], 'x']
+    return(item_count / bigram_count)
+}
+
+tester <- head(df_full_freq_tri, 10)
+
+tester['prob'] <- apply(df_full_freq_tri, 1, calc_prob_2)
+```
